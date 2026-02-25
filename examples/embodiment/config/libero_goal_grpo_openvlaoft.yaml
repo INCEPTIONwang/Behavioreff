@@ -39,6 +39,13 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
+  reward_coef: 5.0
+  use_eff_reward: False
+  eff_reward_coef: 0.8
+  eff_max_step: 150
+  use_temporal_stability_penalty: False
+  temporal_stability_coef: 0.20
+  sigma_floor: 5.0
   rollout_epoch: 16
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
@@ -60,7 +67,9 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  reward_coef: 5.0
+  use_plan_reward: True
+  plan_reward_coef: 1.0
+  plan_reward_base_h: 8
 
   sampling_params:
     do_sample: True
@@ -88,8 +97,8 @@ env:
   train:
     total_num_envs: 64
     group_size: ${algorithm.group_size}
-    max_episode_steps: 512 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 256 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 256
     reward_coef: ${algorithm.reward_coef}
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
@@ -113,9 +122,11 @@ rollout:
   generation_backend: "huggingface"
   enable_offload: True
   pipeline_stage_num: 1
+  plan_horizon: 8
+  action_horizons_pattern: [4,8]
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-goal-traj1/"
+    model_path: "/mnt/43t/wxh/RLinf/models/RLinf-OpenVLAOFT-LIBERO-130"
     precision: ${actor.model.precision}
 
 actor:
@@ -128,7 +139,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-goal-traj1/"
+    model_path: "/mnt/43t/wxh/RLinf/models/RLinf-OpenVLAOFT-LIBERO-130"
     model_type: "openvla_oft"
 
     unnorm_key: libero_goal_no_noops

@@ -349,6 +349,9 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "enable_gradient_accumulation", False
         )
 
+        # if resume_dir is not None:
+        #     cfg.fsdp_config.use_orig_params = False
+
         assert cfg.fsdp_config.backward_prefetch in [
             None,
             "pre",
@@ -731,6 +734,11 @@ def validate_embodied_cfg(cfg):
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
         assert (
+            cfg.env.eval.total_num_envs // env_world_size // stage_num
+        ) % cfg.algorithm.group_size == 0, (
+            "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by algorithm.group_size"
+        )
+        assert (
             cfg.env.eval.max_steps_per_rollout_epoch % cfg.actor.model.num_action_chunks
             == 0
         ), (
@@ -758,6 +766,11 @@ def validate_embodied_cfg(cfg):
             == 0
         ), (
             "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
+        )
+        assert (
+            cfg.env.train.total_num_envs // env_world_size // stage_num
+        ) % cfg.algorithm.group_size == 0, (
+            "env.train.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by algorithm.group_size"
         )
         assert (
             cfg.env.train.max_steps_per_rollout_epoch
@@ -838,10 +851,12 @@ def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
         cfg.algorithm.n_minibatches = cfg.algorithm.get("n_minibatches", 1)
         cfg.algorithm.max_num_gen_batches = cfg.algorithm.get("max_num_gen_batches", 1)
         cfg.actor.micro_batch_size = cfg.algorithm.training_batch_size_per_gpu
+        global_step_batch_size = cfg.data.rollout_batch_size * cfg.algorithm.group_size
+        assert global_step_batch_size % cfg.algorithm.n_minibatches == 0, (
+            f"(data.rollout_batch_size * algorithm.group_size)={global_step_batch_size} must be divisible by algorithm.n_minibatches={cfg.algorithm.n_minibatches}"
+        )
         cfg.actor.global_batch_size = (
-            cfg.data.rollout_batch_size
-            * cfg.algorithm.group_size
-            // cfg.algorithm.n_minibatches
+            global_step_batch_size // cfg.algorithm.n_minibatches
         )
         assert cfg.actor.micro_batch_size >= 1
         assert cfg.actor.global_batch_size >= 1
@@ -903,10 +918,12 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
         cfg.algorithm.n_minibatches = cfg.algorithm.get("n_minibatches", 1)
         cfg.algorithm.max_num_gen_batches = cfg.algorithm.get("max_num_gen_batches", 1)
         cfg.actor.micro_batch_size = cfg.algorithm.training_batch_size_per_gpu
+        global_step_batch_size = cfg.data.rollout_batch_size * cfg.algorithm.group_size
+        assert global_step_batch_size % cfg.algorithm.n_minibatches == 0, (
+            f"(data.rollout_batch_size * algorithm.group_size)={global_step_batch_size} must be divisible by algorithm.n_minibatches={cfg.algorithm.n_minibatches}"
+        )
         cfg.actor.global_batch_size = (
-            cfg.data.rollout_batch_size
-            * cfg.algorithm.group_size
-            // cfg.algorithm.n_minibatches
+            global_step_batch_size // cfg.algorithm.n_minibatches
         )
         assert cfg.actor.micro_batch_size >= 1
         assert cfg.actor.global_batch_size >= 1
@@ -952,6 +969,21 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         cfg.actor = validate_model_cfg_by_hf_config(
             cfg.actor, cfg.rollout.model.model_path
         )
+        component_placement = HybridComponentPlacement(
+            cfg, Cluster(num_nodes=cfg.cluster.num_nodes)
+        )
+        actor_world_size = component_placement.get_world_size("actor")
+        if hasattr(cfg, "data") and hasattr(cfg.data, "rollout_batch_size"):
+            global_step_batch_size = (
+                cfg.data.rollout_batch_size * cfg.algorithm.group_size
+            )
+            assert global_step_batch_size % actor_world_size == 0, (
+                f"(data.rollout_batch_size * algorithm.group_size)={global_step_batch_size} must be divisible by actor_world_size={actor_world_size}"
+            )
+            if cfg.algorithm.group_size > 1:
+                assert cfg.data.rollout_batch_size % actor_world_size == 0, (
+                    f"data.rollout_batch_size={cfg.data.rollout_batch_size} must be divisible by actor_world_size={actor_world_size} to keep groups intact (algorithm.group_size={cfg.algorithm.group_size})"
+                )
         # TODO. Need actually pad padded_vocab_size.
         assert (
             cfg.actor.model.padded_vocab_size
@@ -965,6 +997,17 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
             cfg, Cluster(num_nodes=cfg.cluster.num_nodes)
         )
         actor_world_size = component_placement.get_world_size("actor")
+        if hasattr(cfg, "data") and hasattr(cfg.data, "rollout_batch_size"):
+            global_step_batch_size = (
+                cfg.data.rollout_batch_size * cfg.algorithm.group_size
+            )
+            assert global_step_batch_size % actor_world_size == 0, (
+                f"(data.rollout_batch_size * algorithm.group_size)={global_step_batch_size} must be divisible by actor_world_size={actor_world_size}"
+            )
+            if cfg.algorithm.group_size > 1:
+                assert cfg.data.rollout_batch_size % actor_world_size == 0, (
+                    f"data.rollout_batch_size={cfg.data.rollout_batch_size} must be divisible by actor_world_size={actor_world_size} to keep groups intact (algorithm.group_size={cfg.algorithm.group_size})"
+                )
         assert (
             cfg.actor.global_batch_size
             % (cfg.actor.micro_batch_size * actor_world_size)

@@ -260,16 +260,16 @@ class FSDPStrategyBase(ABC):
             checkpoint_format (str): "dcp" or "local_shard".
         """
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
-        training_state = Checkpoint(
-            model=model,
-            optimizers=optimizers,
-            lr_schedulers=lr_schedulers,
-            opts=opts,
-            fsdp_version=cls.get_fsdp_version(),
-            checkpoint_format=checkpoint_format,
-        )
         try:
             if checkpoint_format == "local_shard":
+                training_state = Checkpoint(
+                    model=model,
+                    optimizers=optimizers,
+                    lr_schedulers=lr_schedulers,
+                    opts=opts,
+                    fsdp_version=cls.get_fsdp_version(),
+                    checkpoint_format=checkpoint_format,
+                )
                 rank = torch.distributed.get_rank()
                 local_ckpt_file = os.path.join(
                     load_path, "local_shard_checkpoint", f"checkpoint_rank_{rank}.pt"
@@ -313,6 +313,41 @@ class FSDPStrategyBase(ABC):
                         f"[Checkpoint] loading DCP checkpoint from {dcp_load_path}"
                     )
 
+                metadata = dcp.FileSystemReader(dcp_load_path).read_metadata()
+                metadata_keys = metadata.state_dict_metadata.keys()
+                has_new_optim_key = any(
+                    key.startswith("fsdp_checkpoint.optimizers.")
+                    for key in metadata_keys
+                )
+                has_legacy_optim_key = any(
+                    key.startswith("fsdp_checkpoint.optim.") for key in metadata_keys
+                )
+                optimizer_state_key = "optim"
+                if has_new_optim_key:
+                    optimizer_state_key = "optimizers"
+                elif has_legacy_optim_key:
+                    optimizer_state_key = "optim"
+
+                if (
+                    has_legacy_optim_key
+                    and not has_new_optim_key
+                    and hasattr(cls, "logger")
+                    and cls.logger is not None
+                ):
+                    cls.logger.warning(
+                        "[Checkpoint] detected legacy DCP optimizer key 'optim'; "
+                        "loading with backward compatibility."
+                    )
+
+                training_state = Checkpoint(
+                    model=model,
+                    optimizers=optimizers,
+                    lr_schedulers=lr_schedulers,
+                    opts=opts,
+                    fsdp_version=cls.get_fsdp_version(),
+                    checkpoint_format=checkpoint_format,
+                    optimizer_state_key=optimizer_state_key,
+                )
                 dcp.load(
                     {"fsdp_checkpoint": training_state},
                     checkpoint_id=dcp_load_path,

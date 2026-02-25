@@ -27,6 +27,7 @@
 # limitations under the License.
 
 import functools
+import warnings
 from enum import Enum
 from typing import Iterable, Optional, Union
 
@@ -126,6 +127,8 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
     fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
     )
+    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
+        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
 
     # Build policies list
     policies = []
@@ -205,21 +208,27 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
     # Add transformer layer policies
     if fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        missing_layer_classes = []
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception(
-                    "Could not find the transformer layer class to wrap in the model."
-                )
+                missing_layer_classes.append(layer_class)
+                continue
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        llm_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            # Transformer layer class to wrap
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(llm_wrap_policy)
+        if missing_layer_classes:
+            warnings.warn(
+                f"[FSDP] Skip missing wrap classes: {missing_layer_classes}. "
+                "If this is unexpected, please check model version and wrap_policy.transformer_layer_cls_to_wrap."
+            )
+
+        if len(transformer_cls_to_wrap) > 0:
+            llm_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(llm_wrap_policy)
 
     if hasattr(module, "_no_split_names"):
         no_split_names = getattr(module, "_no_split_names", None)
@@ -563,24 +572,37 @@ def get_grad_norm_for_mixed_precision(
     The returned norm is in FP32 even if parameters/gradients are in a low precision. This is because the downstream
     use of this return value is a reduction across ranks.
     """
-    params_with_grad = [param for param in params if param.grad is not None]
-    if len(params_with_grad) == 0:
+    has_grad = False
+    if norm_type == torch.inf:
+        grad_norm = zero
+        for param in params:
+            if param.grad is None:
+                continue
+            has_grad = True
+            # Compute per-parameter norm directly from the original gradient
+            # to avoid creating a full fp32 copy for every gradient at once.
+            param_norm = torch.linalg.vector_norm(
+                param.grad.detach(), ord=norm_type, dtype=torch.float32
+            )
+            grad_norm = torch.maximum(grad_norm, param_norm)
+        return grad_norm.to(device=device) if has_grad else zero
+
+    total_norm = zero
+    for param in params:
+        if param.grad is None:
+            continue
+        has_grad = True
+        # Streamingly accumulate p-norm terms to reduce peak memory during
+        # grad-norm computation for large mixed-precision models.
+        param_norm = torch.linalg.vector_norm(
+            param.grad.detach(), ord=norm_type, dtype=torch.float32
+        )
+        total_norm += param_norm.pow(norm_type)
+
+    if not has_grad:
         # Reuse a tensor for zero to avoid a GPU sync
         return zero
-    grads = [param.grad.detach().to(torch.float32) for param in params_with_grad]
-    # Compute the gradient norm in FP32, where we treat the gradients as a
-    # single vector
-    grad_norm = torch.linalg.vector_norm(
-        torch.stack(
-            [
-                torch.linalg.vector_norm(grad, norm_type, dtype=torch.float32)
-                for grad in grads
-            ],
-        ),
-        norm_type,
-        dtype=torch.float32,
-    )
-    return grad_norm.to(device=device)
+    return total_norm.pow(1.0 / norm_type).to(device=device)
 
 
 def get_sharding_strategy(strategy_str: str) -> ShardingStrategy:

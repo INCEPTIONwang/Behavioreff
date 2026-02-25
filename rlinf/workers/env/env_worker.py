@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from typing import Any
 
@@ -32,6 +33,12 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self._train_save_video_base = bool(
+            getattr(self.cfg.env.train.video_cfg, "save_video", False)
+        )
+        self._eval_save_video_base = bool(
+            getattr(self.cfg.env.eval.video_cfg, "save_video", False)
+        )
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -68,8 +75,6 @@ class EnvWorker(Worker):
             )
 
     def init_worker(self):
-        self.enable_offload = self.cfg.env.get("enable_offload", False)
-
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
 
@@ -115,7 +120,9 @@ class EnvWorker(Worker):
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
 
-                if self.enable_offload and hasattr(self.env_list[i], "offload"):
+                if self.cfg.env.train.get("enable_offload", False) and hasattr(
+                    self.env_list[i], "offload"
+                ):
                     self.env_list[i].offload()
 
     @Worker.timer("env_interact_step")
@@ -169,6 +176,10 @@ class EnvWorker(Worker):
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
+        if isinstance(infos, dict) and "chunk_successes" in infos:
+            chunk_successes = infos["chunk_successes"]
+        else:
+            chunk_successes = chunk_terminations
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -179,6 +190,7 @@ class EnvWorker(Worker):
             dones=chunk_dones,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
+            successes=chunk_successes,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
         )
@@ -239,7 +251,25 @@ class EnvWorker(Worker):
         chunk_action = np.concatenate(chunk_action, axis=0)
         return chunk_action
 
-    def finish_rollout(self, mode="train"):
+    def _get_video_interval(self, mode: str) -> int:
+        assert mode in ["train", "eval"]
+        video_cfg = (
+            self.cfg.env.train.video_cfg
+            if mode == "train"
+            else self.cfg.env.eval.video_cfg
+        )
+        interval = int(getattr(video_cfg, "save_video_interval", 1) or 1)
+        return max(interval, 1)
+
+    def _set_video_recording_enabled(self, enabled: bool, mode: str) -> None:
+        if mode == "train":
+            for i in range(self.stage_num):
+                self.env_list[i].video_cfg.save_video = enabled
+        else:
+            for i in range(self.stage_num):
+                self.eval_env_list[i].video_cfg.save_video = enabled
+
+    def finish_rollout(self, mode="train", save_video: bool = True):
         # reset
         if mode == "train":
             for i in range(self.stage_num):
@@ -306,6 +336,13 @@ class EnvWorker(Worker):
 
         env_metrics = defaultdict(list)
         for epoch in range(self.cfg.algorithm.rollout_epoch):
+            base_save_video = self._train_save_video_base
+            video_interval = self._get_video_interval("train")
+            record_video_this_epoch = base_save_video and (
+                (epoch + 1) % video_interval == 0
+            )
+            self._set_video_recording_enabled(record_video_this_epoch, mode="train")
+
             env_output_list = []
             if not self.cfg.env.train.auto_reset:
                 for stage_id in range(self.stage_num):
@@ -383,10 +420,13 @@ class EnvWorker(Worker):
                 (env_output.intervene_actions, env_output.intervene_flags)
                 for env_output in env_output_list
             ]
-            self.finish_rollout()
+            self.finish_rollout(save_video=record_video_this_epoch)
 
+        self._set_video_recording_enabled(self._train_save_video_base, mode="train")
         for env in self.env_list:
-            if self.enable_offload and hasattr(env, "offload"):
+            if self.cfg.env.train.get("enable_offload", False) and hasattr(
+                env, "offload"
+            ):
                 env.offload()
 
         for key, value in env_metrics.items():
@@ -401,7 +441,12 @@ class EnvWorker(Worker):
             self.cfg.env.eval.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
         )
-        for _ in range(self.cfg.algorithm.eval_rollout_epoch):
+        for epoch_idx in range(self.cfg.algorithm.eval_rollout_epoch):
+            base_save_video = self._eval_save_video_base
+            record_video_this_epoch = base_save_video
+            self._set_video_recording_enabled(record_video_this_epoch, mode="eval")
+
+            epoch_eval_info = defaultdict(list)
             for stage_id in range(self.stage_num):
                 self.eval_env_list[stage_id].is_start = True
                 extracted_obs, infos = self.eval_env_list[stage_id].reset()
@@ -424,18 +469,141 @@ class EnvWorker(Worker):
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
+                        epoch_eval_info[key].append(value)
                     if eval_step == n_chunk_steps - 1:
                         continue
                     self.send_env_batch(
                         output_channel, env_output.to_dict(), mode="eval"
                     )
 
-            self.finish_rollout(mode="eval")
+            self.finish_rollout(mode="eval", save_video=record_video_this_epoch)
+            if len(epoch_eval_info) > 0:
+                epoch_metrics = {
+                    k: torch.cat(v, dim=0).contiguous().cpu()
+                    for k, v in epoch_eval_info.items()
+                }
+                log_dir = self.cfg.runner.logger.log_path
+                os.makedirs(log_dir, exist_ok=True)
+                epoch_csv_path = os.path.join(
+                    log_dir, f"eval_details_rank{self._rank}.csv"
+                )
+
+                def _mean_of(key):
+                    return (
+                        epoch_metrics[key].float().mean().item()
+                        if key in epoch_metrics
+                        else None
+                    )
+
+                lines = []
+                lines.append(
+                    f"epoch={epoch_idx + 1} success_once={_mean_of('success_once')} success_at_end={_mean_of('success_at_end')} episode_len={_mean_of('episode_len')} reward={_mean_of('reward')}"
+                )
+                if "reset_state_id" in epoch_metrics:
+                    uniq = (
+                        torch.unique(epoch_metrics["reset_state_id"]).numpy().tolist()
+                    )
+                    lines.append(f"reset_state_ids={uniq}")
+                if "first_success_step" in epoch_metrics:
+                    fss = epoch_metrics["first_success_step"].numpy().tolist()
+                    lines.append(f"first_success_step_sample={fss[: min(5, len(fss))]}")
+                if (
+                    "task_id" in epoch_metrics
+                    and "trial_id" in epoch_metrics
+                    and "success_once" in epoch_metrics
+                    and "episode_len" in epoch_metrics
+                ):
+                    header = "task_id,trial_id,reset_state_id,success_once,success_at_end,first_success_step,episode_len,epoch\n"
+                    if not os.path.exists(epoch_csv_path):
+                        with open(epoch_csv_path, "w") as f:
+                            f.write(header)
+                    task_ids = epoch_metrics["task_id"].numpy().tolist()
+                    trial_ids = epoch_metrics["trial_id"].numpy().tolist()
+                    reset_ids = (
+                        epoch_metrics.get("reset_state_id", torch.tensor([]))
+                        .numpy()
+                        .tolist()
+                        if "reset_state_id" in epoch_metrics
+                        else [None] * len(task_ids)
+                    )
+                    success_once = (
+                        epoch_metrics["success_once"].numpy().astype(int).tolist()
+                    )
+                    success_at_end = (
+                        epoch_metrics.get("success_at_end", torch.tensor([]))
+                        .numpy()
+                        .astype(int)
+                        .tolist()
+                        if "success_at_end" in epoch_metrics
+                        else [None] * len(task_ids)
+                    )
+                    first_success_step = (
+                        epoch_metrics.get("first_success_step", torch.tensor([]))
+                        .numpy()
+                        .tolist()
+                        if "first_success_step" in epoch_metrics
+                        else [None] * len(task_ids)
+                    )
+                    episode_len = epoch_metrics["episode_len"].numpy().tolist()
+                    with open(epoch_csv_path, "a") as f:
+                        for i in range(len(task_ids)):
+                            f.write(
+                                f"{task_ids[i]},{trial_ids[i]},{reset_ids[i]},{success_once[i]},{success_at_end[i]},{first_success_step[i]},{episode_len[i]},{epoch_idx + 1}\n"
+                            )
+                print(" ".join(lines))
         for stage_id in range(self.stage_num):
-            if self.enable_offload and hasattr(self.eval_env_list[stage_id], "offload"):
+            if self.cfg.env.eval.get("enable_offload", False) and hasattr(
+                self.eval_env_list[stage_id], "offload"
+            ):
                 self.eval_env_list[stage_id].offload()
+        self._set_video_recording_enabled(self._eval_save_video_base, mode="eval")
 
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        if (
+            "task_id" in eval_metrics
+            and "trial_id" in eval_metrics
+            and "success_once" in eval_metrics
+            and "first_success_step" in eval_metrics
+            and "episode_len" in eval_metrics
+        ):
+            log_dir = self.cfg.runner.logger.log_path
+            os.makedirs(log_dir, exist_ok=True)
+            csv_path = os.path.join(log_dir, f"eval_details_rank{self._rank}.csv")
+            task_ids = eval_metrics["task_id"].numpy().tolist()
+            trial_ids = eval_metrics["trial_id"].numpy().tolist()
+            reset_ids = (
+                eval_metrics.get("reset_state_id", torch.tensor([])).numpy().tolist()
+                if "reset_state_id" in eval_metrics
+                else [None] * len(task_ids)
+            )
+            success_once = eval_metrics["success_once"].numpy().astype(int).tolist()
+            success_at_end = (
+                eval_metrics.get("success_at_end", torch.tensor([]))
+                .numpy()
+                .astype(int)
+                .tolist()
+                if "success_at_end" in eval_metrics
+                else [None] * len(task_ids)
+            )
+            first_success_step = eval_metrics["first_success_step"].numpy().tolist()
+            episode_len = eval_metrics["episode_len"].numpy().tolist()
+            with open(csv_path, "w") as f:
+                f.write(
+                    "task_id,trial_id,reset_state_id,success_once,success_at_end,first_success_step,episode_len\n"
+                )
+                for i in range(len(task_ids)):
+                    f.write(
+                        f"{task_ids[i]},{trial_ids[i]},{reset_ids[i]},{success_once[i]},{success_at_end[i]},{first_success_step[i]},{episode_len[i]}\n"
+                    )
+            for k in [
+                "task_id",
+                "trial_id",
+                "reset_state_id",
+                "first_success_step",
+            ]:
+                if k in eval_metrics:
+                    del eval_metrics[k]
 
         return eval_metrics

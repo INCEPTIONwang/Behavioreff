@@ -14,11 +14,15 @@
 
 import copy
 import os
+import sys
 from typing import Optional, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
+
+sys.path.append("/mnt/43t/wxh/RLinf/LIBERO")
+
 from libero.libero import get_libero_path
 from libero.libero.benchmark import Benchmark
 from libero.libero.envs import OffScreenRenderEnv
@@ -219,6 +223,7 @@ class LiberoEnv(gym.Env):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
+        self.first_success_step = np.full(self.num_envs, -1, dtype=np.int32)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -229,21 +234,34 @@ class LiberoEnv(gym.Env):
             self.fail_once[mask] = False
             self.returns[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self.first_success_step[env_idx] = -1
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
             self.fail_once[:] = False
             self.returns[:] = 0.0
             self._elapsed_steps[:] = 0
+            self.first_success_step[:] = -1
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
         self.returns += step_reward
         self.success_once = self.success_once | terminations
+        new_success = np.logical_and(terminations, self.first_success_step < 0)
+        if new_success.any():
+            self.first_success_step[new_success] = self._elapsed_steps[new_success]
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["task_id"] = self.task_ids.copy()
+        episode_info["trial_id"] = self.trial_ids.copy()
+        base = np.zeros(self.num_envs, dtype=int)
+        for t in range(len(self.cumsum_trial_id_bins)):
+            mask = self.task_ids == t
+            base[mask] = self.cumsum_trial_id_bins[t - 1] if t > 0 else 0
+        episode_info["reset_state_id"] = base + self.trial_ids
+        episode_info["first_success_step"] = self.first_success_step.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -379,6 +397,7 @@ class LiberoEnv(gym.Env):
         infos_list = []
 
         chunk_rewards = []
+        chunk_successes = []
 
         raw_chunk_terminations = []
         raw_chunk_truncations = []
@@ -391,6 +410,15 @@ class LiberoEnv(gym.Env):
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
+            if isinstance(infos, dict) and "success" in infos:
+                step_success = infos["success"]
+            else:
+                step_success = terminations
+            if not torch.is_tensor(step_success):
+                step_success = to_tensor(step_success)
+            if step_success.dtype is not torch.bool:
+                step_success = step_success.bool()
+            chunk_successes.append(step_success)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
@@ -420,6 +448,8 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        if isinstance(infos, dict):
+            infos["chunk_successes"] = torch.stack(chunk_successes, dim=1)
         return (
             obs_list,
             chunk_rewards,

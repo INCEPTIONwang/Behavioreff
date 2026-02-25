@@ -27,6 +27,18 @@ def copy_dict_tensor(next_extracted_obs: dict):
     return ret
 
 
+def clone_nested(data):
+    if isinstance(data, torch.Tensor):
+        return data.detach().clone().contiguous()
+    if isinstance(data, dict):
+        return {k: clone_nested(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [clone_nested(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(clone_nested(v) for v in data)
+    return data
+
+
 def put_tensor_device(data_dict, device):
     if data_dict is None:
         return None
@@ -45,7 +57,15 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
     splited_list = [{} for _ in range(split_size)]
     for key, value in data.items():
         if isinstance(value, torch.Tensor):
-            split_vs = torch.chunk(value, split_size, dim=dim)
+            if value.ndim == 0 or value.shape[dim] < split_size:
+                # Broadcast small/global tensors across splits.
+                split_vs = [value for _ in range(split_size)]
+            else:
+                split_vs = torch.chunk(value, split_size, dim=dim)
+                if len(split_vs) < split_size:
+                    split_vs = list(split_vs) + [split_vs[-1]] * (
+                        split_size - len(split_vs)
+                    )
         elif value is None:
             split_vs = [None for _ in range(split_size)]
         elif isinstance(value, dict):

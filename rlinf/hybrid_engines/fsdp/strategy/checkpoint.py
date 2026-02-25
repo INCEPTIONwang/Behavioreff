@@ -39,6 +39,7 @@ class Checkpoint(Stateful):
         opts: StateDictOptions,
         fsdp_version: FSDPVersion,
         checkpoint_format: str = "dcp",
+        optimizer_state_key: str = "optimizers",
     ):
         self.model = model
         self.optimizers = optimizers
@@ -50,6 +51,7 @@ class Checkpoint(Stateful):
         self.opts = opts
         self.fsdp_version = fsdp_version
         self.checkpoint_format = checkpoint_format
+        self.optimizer_state_key = optimizer_state_key
 
     def _get_local_optim_state_dicts(self):
         if isinstance(self.optimizers, Optimizer):
@@ -78,11 +80,11 @@ class Checkpoint(Stateful):
 
             out = {
                 "model": model_sd,
-                "optimizers": optim_sd,
                 "lr_schedulers": lr_sched_sd,
                 "fsdp_version": self.fsdp_version.value,
                 "rng": get_rng_state(),
             }
+            out[self.optimizer_state_key] = optim_sd
         else:
             model_sd, optim_sd = get_state_dict(
                 model=self.model,
@@ -94,11 +96,11 @@ class Checkpoint(Stateful):
 
             out = {
                 "model": model_sd,
-                "optimizers": optim_sd,
                 "lr_schedulers": lr_sched_sd,
                 "fsdp_version": self.fsdp_version.value,
                 "rng": get_rng_state(),
             }
+            out[self.optimizer_state_key] = optim_sd
         return out
 
     def load_state_dict(self, state):
@@ -112,7 +114,9 @@ class Checkpoint(Stateful):
         if self.checkpoint_format == "local_shard":
             self.model.load_state_dict(state["model"])
 
-            self._load_local_optim_state_dicts(state["optimizers"])
+            self._load_local_optim_state_dicts(
+                state.get("optimizers", state.get("optim"))
+            )
 
         else:
             set_state_dict(

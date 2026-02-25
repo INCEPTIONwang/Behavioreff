@@ -91,8 +91,8 @@ env:
     total_num_envs: 64
   eval:
     total_num_envs: 500
-    auto_reset: True
-    ignore_terminations: True
+    auto_reset: False
+    ignore_terminations: False
     max_episode_steps: 100
     max_steps_per_rollout_epoch: 100
     group_size: 1

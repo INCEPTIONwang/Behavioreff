@@ -284,9 +284,26 @@ class FSDPModelManager:
         Args:
             load_path: the directory to load checkpoint.
         """
+        # NOTE:
+        # torch.distributed.checkpoint with FSDP requires flat params to be on CUDA
+        # when materializing model state dict. If actor offload is enabled, the model
+        # or optimizer may be on CPU here and would trigger runtime error during load.
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if restore_weight_offload:
+            self.offload_param_and_grad()
+        if restore_optimizer_offload:
+            self.offload_optimizer()
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

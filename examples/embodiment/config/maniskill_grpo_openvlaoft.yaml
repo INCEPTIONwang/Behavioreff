@@ -41,6 +41,15 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
+  use_eff_reward: False
+  eff_reward_coef: 0.8
+  eff_max_step: 80
+  use_temporal_stability_penalty: False
+  temporal_stability_coef: 0.20
+  sigma_floor: 5.0
+  use_plan_reward: False
+  plan_reward_coef: 1.0
+  plan_reward_base_h: 8
 
   rollout_epoch: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
@@ -79,6 +88,10 @@ algorithm:
     max_length: 1024
     min_length: 1
 
+  filter_rewards: True # filter rewards outside the range [rewards_lower_bound, rewards_upper_bound]
+  rewards_lower_bound: 0.5
+  rewards_upper_bound: 5.0
+
 env:
   group_name: "EnvGroup"
 
@@ -104,6 +117,8 @@ rollout:
   generation_backend: "huggingface"
   enable_offload: True
   pipeline_stage_num: 1
+  plan_horizon: 8
+  action_horizons_pattern: [4,8]
 
   model:
     model_path: "/path/to/model/Openvla-oft-SFT-libero10-trajall/"
@@ -130,13 +145,13 @@ actor:
     max_prompt_length: 30
 
   optim:
-    lr: 1.0e-4
+    lr: 2.0e-5
     value_lr: 3.0e-3
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-08
     weight_decay: 0.01
-    clip_grad: 10.0
+    clip_grad: 1.0
 
   # Override the default values in training_backend/fsdp
   fsdp_config:

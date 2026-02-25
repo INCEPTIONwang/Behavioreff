@@ -13,7 +13,7 @@ precision: "bf16"
 value_type: action_level
 
 action_dim: 7
-num_action_chunks: 8
+num_action_chunks: 4
 use_proprio: False
 use_film: False
 unnorm_key: libero_10_no_noops

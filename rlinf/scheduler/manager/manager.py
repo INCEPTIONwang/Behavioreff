@@ -89,7 +89,7 @@ class Manager:
     MANAGER_NAME = ""
     proxy: ManagerProxy = None
     PID = None
-    ENV_LIST = ["RAY_ADDRESS"]
+    ENV_LIST = ["RAY_ADDRESS", "RLINF_NAMESPACE"]
 
     @classmethod
     def get_proxy(cls: type[ManagerClsType], no_wait: bool = False) -> ManagerClsType:

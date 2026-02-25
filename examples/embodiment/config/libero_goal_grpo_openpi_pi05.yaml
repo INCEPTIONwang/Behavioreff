@@ -40,6 +40,14 @@ algorithm:
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
   reward_coef: 1.0
+  use_eff_reward: True
+  eff_reward_coef: 1.0
+  eff_max_step: 200
+  use_temporal_stability_penalty: True
+  temporal_stability_coef: 0.15
+  use_plan_reward: False
+  plan_reward_coef: 1.0
+  plan_reward_base_h: 20
   rollout_epoch: 8
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
@@ -64,7 +72,7 @@ algorithm:
 
   filter_rewards: True
   rewards_lower_bound: 0.1
-  rewards_upper_bound: 0.9
+  rewards_upper_bound: 1.0
   # params for generation
   sampling_params:
     do_sample: True
@@ -89,8 +97,8 @@ env:
   train:
     total_num_envs: 64
     group_size: ${algorithm.group_size}
-    max_episode_steps: 320 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 320
+    max_episode_steps: 240 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 240
   eval:
     total_num_envs: 500
     auto_reset: True
@@ -110,6 +118,8 @@ rollout:
   recompute_logprobs: False
   enable_offload: False
   pipeline_stage_num: 1
+  plan_horizon: 15
+  action_horizons_pattern: [5,10,15]
 
   model:
     model_path: "/path/to/model/RLinf-Pi05-SFT"

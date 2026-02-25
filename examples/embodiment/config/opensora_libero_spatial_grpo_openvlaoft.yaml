@@ -93,18 +93,20 @@ env:
     reward_coef: ${algorithm.reward_coef}
     reset_gripper_open: False
     opensora_wm_hf_ckpt_path: "/path/to/model/RLinf-OpenSora-LIBERO-Spatial"
+    enable_offload: True
   eval:
     total_num_envs: 500
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 512
-    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 256
+    max_steps_per_rollout_epoch: 256
     group_size: 1
     reset_gripper_open: False
     is_eval: True
     video_cfg:
       save_video: True
       video_base_dir: ${runner.logger.log_path}/video/eval
+    enable_offload: True
 
 rollout:
   group_name: "RolloutGroup"

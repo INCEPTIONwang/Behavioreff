@@ -76,11 +76,42 @@ def preprocess_embodied_advantages_inputs(
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
+    num_chunk, bsz, action_chunk_size = rewards.shape
+    successes = kwargs.get("successes", None)
+    if successes is not None:
+        if not torch.is_tensor(successes):
+            successes = torch.as_tensor(successes, device=rewards.device)
+        else:
+            successes = successes.to(device=rewards.device)
+        if successes.dtype is not torch.bool:
+            successes = successes.bool()
     if kwargs["reward_type"] == "chunk_level":
-        # TODO: need check
-        # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
+        if successes is not None:
+            success_mask_action = successes.transpose(1, 2).reshape(
+                num_chunk * action_chunk_size, bsz
+            )
+        else:
+            flat_rewards_action = rewards.transpose(1, 2).reshape(
+                num_chunk * action_chunk_size, bsz
+            )
+            success_mask_action = flat_rewards_action > 0
+        any_success_action = success_mask_action.any(dim=0)
+        first_success_step_action = torch.where(
+            any_success_action,
+            success_mask_action.float().argmax(dim=0),
+            torch.full(
+                (bsz,),
+                -1,
+                dtype=torch.long,
+                device=rewards.device,
+            ),
+        )
+        kwargs["first_success_step_action"] = first_success_step_action
+
         rewards = rewards.sum(dim=-1, keepdim=True)
         dones = dones.max(dim=-1, keepdim=True)[0]
+        if successes is not None:
+            successes = successes.any(dim=-1, keepdim=True)
         if loss_mask is not None:
             loss_mask = loss_mask.max(dim=-1, keepdim=True)[0]
         if loss_mask_sum is not None:
@@ -101,6 +132,8 @@ def preprocess_embodied_advantages_inputs(
     # Reshape -> [n_steps, bsz]
     # Rewards [n_steps, bsz]
     rewards = rewards.transpose(1, 2).reshape(n_steps, bsz)
+    if successes is not None:
+        successes = successes.transpose(1, 2).reshape(n_steps, bsz)
 
     # Loss Mask (T steps) [bsz, n_steps]
     if loss_mask is not None:
@@ -111,6 +144,38 @@ def preprocess_embodied_advantages_inputs(
         (num_chunk + 1) * chunk_size, bsz
     )
     dones = flattened_dones_full[-(n_steps + 1) :]
+
+    # Plan horizon per step for EOS gathering.
+    # Only required when plan reward is enabled with positive coefficient.
+    use_plan_reward = kwargs.get("use_plan_reward", True)
+    plan_coef = float(kwargs.get("plan_reward_coef", 0.0) or 0.0)
+    if "plan_horizon" in kwargs and kwargs["plan_horizon"] is not None:
+        ph = kwargs["plan_horizon"]
+        if not torch.is_tensor(ph):
+            ph = torch.as_tensor(ph)
+        if ph.ndim == 1 and ph.shape[0] == bsz:
+            ph = ph.unsqueeze(0).repeat(num_chunk, 1)  # [num_chunk, bsz]
+        elif ph.ndim == 2:
+            if ph.shape[0] > num_chunk:
+                ph = ph[:num_chunk]
+            elif ph.shape[0] < num_chunk:
+                # pad by repeating last row
+                pad_rows = num_chunk - ph.shape[0]
+                ph = torch.cat([ph, ph[-1:].repeat(pad_rows, 1)], dim=0)
+            if ph.shape[1] != bsz:
+                raise ValueError(
+                    f"plan_horizon bsz 不匹配，期望 {bsz}，实际 {ph.shape[1]}"
+                )
+        else:
+            raise ValueError(
+                f"plan_horizon 形状不匹配，期望[{num_chunk},{bsz}]，实际{tuple(ph.shape)}"
+            )
+        ph_steps = ph.repeat_interleave(chunk_size, dim=0)  # [n_steps, bsz]
+        kwargs["plan_horizon_steps"] = ph_steps
+    elif use_plan_reward and plan_coef > 0.0:
+        raise ValueError(
+            "plan_horizon 缺失，请确保在 rollout.forward_inputs 中设置 plan_horizon 并提升到顶层传入优势计算"
+        )
 
     if kwargs["adv_type"] == "gae":
         flattened_values_full = values.transpose(1, 2).reshape(
@@ -125,6 +190,7 @@ def preprocess_embodied_advantages_inputs(
             "values": values,
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
+            "successes": successes,
         }
     )
 
@@ -136,16 +202,196 @@ def calculate_scores(
     dones: torch.Tensor,
     **kwargs,
 ) -> dict:
-    scores = torch.zeros(kwargs["batch_size"])
+    use_temporal_stability_penalty = kwargs.get("use_temporal_stability_penalty", True)
+    use_eff_reward = kwargs.get("use_eff_reward", True)
+    use_plan_reward = kwargs.get("use_plan_reward", True)
+    scores = torch.zeros(
+        kwargs["batch_size"], device=rewards.device, dtype=rewards.dtype
+    )
     for step in reversed(range(kwargs["n_steps"])):
         scores = scores * ~dones[step + 1]
         scores += rewards[step]
+
+    reward_scale = rewards.max()
+
+    success_steps = kwargs.get("successes", None)
+    if success_steps is not None:
+        if not torch.is_tensor(success_steps):
+            success_steps = torch.as_tensor(success_steps, device=rewards.device)
+        else:
+            success_steps = success_steps.to(device=rewards.device)
+        if success_steps.dtype is not torch.bool:
+            success_steps = success_steps.bool()
+        if success_steps.shape != rewards.shape:
+            raise ValueError(
+                f"successes shape mismatch: expected {tuple(rewards.shape)}, got {tuple(success_steps.shape)}"
+            )
+    else:
+        success_steps = rewards > 0
+
+    if "first_success_step_action" in kwargs:
+        first_success_step = (
+            kwargs["first_success_step_action"].view(-1, kwargs["group_size"]).float()
+        )
+    else:
+        any_success = success_steps.any(dim=0)
+        first_success_step = torch.where(
+            any_success,
+            success_steps.float().argmax(dim=0),
+            torch.full(
+                (kwargs["batch_size"],),
+                -1,
+                dtype=torch.long,
+                device=rewards.device,
+            ),
+        )
+        first_success_step = first_success_step.view(-1, kwargs["group_size"]).float()
+
     scores = scores.reshape(-1, kwargs["group_size"])
+
+    # Plan reward: add at score stage, similar to eff_reward
+    plan_coef = float(kwargs.get("plan_reward_coef", 0.0) or 0.0)
+    plan_term = torch.zeros_like(scores)
+    plan_reward = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    plan_reward_count = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    if ("plan_horizon_steps" in kwargs) and (kwargs["plan_horizon_steps"] is not None):
+        # EOS index per sample
+        dones_full = dones  # [n_steps+1, bsz]
+        # cast to integer for argmax on CPU
+        pos = torch.flip(dones_full.long(), dims=[0]).argmax(dim=0)  # [bsz]
+        eos_idx = kwargs["n_steps"] - 1 - pos  # [bsz], last valid reward index
+        # horizon at EOS
+        plan_horizon_steps = kwargs["plan_horizon_steps"].float()  # [n_steps, bsz]
+        h_at_eos = plan_horizon_steps.gather(0, eos_idx[None, :]).squeeze(0)  # [bsz]
+        base_h = float(kwargs.get("plan_reward_base_h", 15) or 15)
+        # success mask per sample
+        success_mask = success_steps.any(dim=0).float()  # [bsz]
+        # horizon success counts for logging (dynamic bins)
+        plan_bins = kwargs.get("plan_horizon_bins", None)
+        if plan_bins is None:
+            unique_h = sorted({int(v) for v in h_at_eos.detach().cpu().tolist()})
+        else:
+            unique_h = []
+            for v in plan_bins:
+                try:
+                    unique_h.append(int(v))
+                except (TypeError, ValueError):
+                    continue
+            unique_h = sorted(set(unique_h))
+        for h in unique_h:
+            if h <= 0:
+                continue
+            h_mask = h_at_eos == h
+            key_base = f"plan_h{h}"
+            kwargs[f"{key_base}_success_count"] = success_mask[h_mask].sum().to(
+                rewards.dtype
+            )
+            kwargs[f"{key_base}_total_count"] = h_mask.sum().to(rewards.dtype)
+        kwargs["plan_success_count"] = success_mask.sum().to(rewards.dtype)
+        kwargs["plan_total_count"] = torch.tensor(
+            success_mask.numel(), device=rewards.device, dtype=rewards.dtype
+        )
+        if use_plan_reward and plan_coef > 0.0:
+            plan_term = reward_scale * plan_coef * (h_at_eos / base_h) * success_mask
+            plan_term = plan_term.reshape(-1, kwargs["group_size"])
+            scores = scores + plan_term
+    elif use_plan_reward and plan_coef > 0.0:
+        raise ValueError(
+            "plan_horizon_steps 缺失：预处理未生成逐步的计划时长，请检查输入"
+        )
+
+    valid_mask = first_success_step >= 0
+    eff_max_step = kwargs.get("eff_max_step", None)
+    eff_reward_coef = kwargs.get("eff_reward_coef", 1.0)
+    temporal_stability_coef = kwargs.get("temporal_stability_coef", 1.0)
+    std_steps = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    delta_pen = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    eff_reward_count = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    temporal_stability_penalty_count = torch.zeros(
+        (), device=rewards.device, dtype=rewards.dtype
+    )
+    std_steps_count = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+    delta_pen_count = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+
+    if eff_max_step is not None and eff_max_step > 0:
+        eff_raw = (float(eff_max_step) - first_success_step) / float(eff_max_step)
+        eff_raw = torch.clamp(eff_raw, min=0.0) * valid_mask.float()
+        eff_term = eff_raw * reward_scale * eff_reward_coef
+        if not use_eff_reward:
+            eff_term = torch.zeros_like(eff_term)
+
+        count_valid = valid_mask.sum(dim=1).clamp(min=1).float()
+        mu = (first_success_step * valid_mask).sum(dim=1) / count_valid
+        diff = (first_success_step - mu.unsqueeze(-1)) * valid_mask
+        sigma = ((diff**2).sum(dim=1) / count_valid).sqrt()
+        sigma_floor = float(kwargs.get("sigma_floor", 5.0) or 5.0)
+        sigma_expand = sigma.unsqueeze(-1)
+        temporal_z = torch.zeros_like(first_success_step)
+        penalty_mask = valid_mask & (sigma_expand >= sigma_floor)
+        temporal_z[penalty_mask] = (
+            diff.abs() / sigma_expand.clamp_min(1e-6)
+        )[penalty_mask]
+        temporal_penalty_norm = torch.tanh(temporal_z)
+        temporal_term = temporal_penalty_norm * reward_scale * temporal_stability_coef
+        if not use_temporal_stability_penalty:
+            temporal_term = torch.zeros_like(temporal_term)
+
+        scores = scores + eff_term - temporal_term
+
+        group_valid_mask = valid_mask.any(dim=1)
+
+        if group_valid_mask.any():
+            std_steps = sigma[group_valid_mask].mean()
+            std_steps_count = group_valid_mask.sum().to(rewards.dtype)
+
+            pen = temporal_penalty_norm * reward_scale * temporal_stability_coef
+            pen_for_max = pen.masked_fill(~valid_mask, float("-inf"))
+            pen_for_min = pen.masked_fill(~valid_mask, float("inf"))
+            group_max, _ = pen_for_max.max(dim=1)
+            group_min, _ = pen_for_min.min(dim=1)
+            delta_group = group_max - group_min
+            delta_pen = delta_group[group_valid_mask].mean()
+            delta_pen_count = group_valid_mask.sum().to(rewards.dtype)
+    else:
+        eff_term = torch.zeros_like(scores)
+        temporal_term = torch.zeros_like(scores)
+
+    eligible_sample_mask = valid_mask
+
+    if eligible_sample_mask.any():
+        eff_reward = eff_term[eligible_sample_mask].mean()
+        temporal_stability_penalty = temporal_term[eligible_sample_mask].mean()
+        eligible_count = eligible_sample_mask.sum().to(rewards.dtype)
+        eff_reward_count = eligible_count
+        temporal_stability_penalty_count = eligible_count
+        # plan_reward logging independent of eligible gating: use success_mask
+        if use_plan_reward and plan_coef > 0.0:
+            succ_mask_vec = success_steps.any(dim=0)  # [bsz]
+            if succ_mask_vec.any():
+                plan_reward = plan_term.reshape(-1)[succ_mask_vec].mean()
+                plan_reward_count = succ_mask_vec.sum().to(rewards.dtype)
+    else:
+        eff_reward = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+        temporal_stability_penalty = torch.zeros(
+            (), device=rewards.device, dtype=rewards.dtype
+        )
+        plan_reward = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
+        plan_reward_count = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
 
     kwargs.update(
         {
             "rewards": scores,
             "dones": dones,
+            "eff_reward": eff_reward,
+            "temporal_stability_penalty": temporal_stability_penalty,
+            "STD_steps": std_steps,
+            "delta_pen": delta_pen,
+            "eff_reward_count": eff_reward_count,
+            "temporal_stability_penalty_count": temporal_stability_penalty_count,
+            "STD_steps_count": std_steps_count,
+            "delta_pen_count": delta_pen_count,
+            "plan_reward": plan_reward,
+            "plan_reward_count": plan_reward_count,
         }
     )
 
@@ -170,6 +416,42 @@ def postprocess_embodied_advantages_outputs(
     if returns is not None:
         returns = returns.reshape(num_chunk, chunk_size, -1).transpose(1, 2)
         res.update({"returns": returns})
+
+    if "eff_reward" in kwargs:
+        res.update({"eff_reward": kwargs["eff_reward"]})
+    if "temporal_stability_penalty" in kwargs:
+        res.update({"temporal_stability_penalty": kwargs["temporal_stability_penalty"]})
+    if "STD_steps" in kwargs:
+        res.update({"STD_steps": kwargs["STD_steps"]})
+    if "delta_pen" in kwargs:
+        res.update({"delta_pen": kwargs["delta_pen"]})
+    if "eff_reward_count" in kwargs:
+        res.update({"eff_reward_count": kwargs["eff_reward_count"]})
+    if "temporal_stability_penalty_count" in kwargs:
+        res.update(
+            {
+                "temporal_stability_penalty_count": kwargs[
+                    "temporal_stability_penalty_count"
+                ]
+            }
+        )
+    if "STD_steps_count" in kwargs:
+        res.update({"STD_steps_count": kwargs["STD_steps_count"]})
+    if "delta_pen_count" in kwargs:
+        res.update({"delta_pen_count": kwargs["delta_pen_count"]})
+    if "plan_reward" in kwargs:
+        res.update({"plan_reward": kwargs["plan_reward"]})
+    if "plan_reward_count" in kwargs:
+        res.update({"plan_reward_count": kwargs["plan_reward_count"]})
+    # Per-horizon success counts (dynamic)
+    for key, value in kwargs.items():
+        if key.startswith("plan_h") and (
+            key.endswith("_success_count") or key.endswith("_total_count")
+        ):
+            res.update({key: value})
+    for key in ["plan_success_count", "plan_total_count"]:
+        if key in kwargs:
+            res.update({key: kwargs[key]})
 
     return res
 

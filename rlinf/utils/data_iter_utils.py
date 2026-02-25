@@ -128,7 +128,7 @@ def get_iterator_k_split(
 
         if isinstance(batch, (dict, UserDict)):
             tensor_items = {
-                k: v for k, v in batch.items() if isinstance(v, torch.Tensor)
+                k: v for k, v in batch.items() if isinstance(v, torch.Tensor) and v.ndim >= 1
             }
             if tensor_items:
                 batch_size = next(iter(tensor_items.values())).shape[0]
@@ -176,15 +176,26 @@ def get_iterator_k_split(
 
     if isinstance(batch, (dict, UserDict)):
         discard_items = [
-            k for k, v in batch.items() if not isinstance(v, (torch.Tensor, list))
+            k
+            for k, v in batch.items()
+            if (
+                not isinstance(v, (torch.Tensor, list))
+                or (isinstance(v, torch.Tensor) and v.ndim == 0)
+            )
         ]
         if len(discard_items) > 0:
             logging.warning(
                 f"Only support splitting torch.Tensor and List[torch.Tensor]. Discarding the following keys from the batch: {discard_items}",
             )
 
-        batch = {k: v for k, v in batch.items() if isinstance(v, (torch.Tensor, list))}
-        tensor_items = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        batch = {
+            k: v
+            for k, v in batch.items()
+            if isinstance(v, (torch.Tensor, list)) and not (torch.is_tensor(v) and v.ndim == 0)
+        }
+        tensor_items = {
+            k: v for k, v in batch.items() if isinstance(v, torch.Tensor) and v.ndim >= 1
+        }
         list_items = {k: v for k, v in batch.items() if isinstance(v, list)}
 
         # Split tensor items

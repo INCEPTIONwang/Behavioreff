@@ -258,6 +258,13 @@ class RecordVideo(gym.Wrapper):
         terminations: Optional[Any] = None,
     ):
         """Extract frames from obs and append to the buffer."""
+        # When recording is disabled for this rollout epoch, do not accumulate
+        # frames. Also clear any stale buffer to avoid cross-epoch carryover.
+        if not self.video_cfg.get("save_video", True):
+            if self.render_images:
+                self.render_images = []
+            return
+
         frames = self._extract_frame_batches(obs)
         if not frames:
             warnings.warn(

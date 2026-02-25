@@ -76,9 +76,15 @@ def compute_evaluate_metrics(eval_metrics_list):
         ]
 
     for key in all_eval_metrics:
-        all_eval_metrics[key] = (
-            torch.concat(all_eval_metrics[key]).float().mean().numpy()
-        )
+        values = torch.concat(all_eval_metrics[key]).float()
+        if "first_success_step" in key:
+            mask = values >= 0
+            if mask.any():
+                all_eval_metrics[key] = values[mask].mean().item()
+            else:
+                all_eval_metrics[key] = -1.0
+        else:
+            all_eval_metrics[key] = values.mean().item()
 
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
@@ -88,25 +94,31 @@ def compute_evaluate_metrics(eval_metrics_list):
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
+    device = torch.cuda.current_device()
 
     if "rewards" in data_buffer:
         rewards = data_buffer["rewards"].clone()
-        mean_rewards = torch.mean(rewards).to(torch.cuda.current_device())
-        torch.distributed.all_reduce(mean_rewards, op=torch.distributed.ReduceOp.AVG)
+        rewards = rewards.to(device)
+        total_reward = rewards.sum()
+        torch.distributed.all_reduce(total_reward, op=torch.distributed.ReduceOp.SUM)
+        num_elements = torch.tensor(rewards.numel(), dtype=torch.float32, device=device)
+        torch.distributed.all_reduce(num_elements, op=torch.distributed.ReduceOp.SUM)
+        mean_rewards = total_reward / num_elements
 
         rewards_metrics = {
-            "rewards": mean_rewards.item(),
+            "total_reward": total_reward.item(),
+            "rewards_mean": mean_rewards.item(),
         }
         rollout_metrics.update(rewards_metrics)
 
     if "advantages" in data_buffer:
         advantages = data_buffer["advantages"]
-        mean_adv = torch.mean(advantages).to(torch.cuda.current_device())
+        mean_adv = torch.mean(advantages).to(device)
         torch.distributed.all_reduce(mean_adv, op=torch.distributed.ReduceOp.AVG)
         max_adv = torch.max(advantages).detach().item()
         min_adv = torch.min(advantages).detach().item()
         reduce_adv_tensor = torch.as_tensor(
-            [-min_adv, max_adv], device=torch.cuda.current_device(), dtype=torch.float32
+            [-min_adv, max_adv], device=device, dtype=torch.float32
         )
         torch.distributed.all_reduce(
             reduce_adv_tensor, op=torch.distributed.ReduceOp.MAX
@@ -122,12 +134,12 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
 
     if data_buffer.get("returns", None) is not None:
         returns = data_buffer["returns"]
-        mean_ret = torch.mean(returns).to(torch.cuda.current_device())
+        mean_ret = torch.mean(returns).to(device)
         torch.distributed.all_reduce(mean_ret, op=torch.distributed.ReduceOp.AVG)
         max_ret = torch.max(returns).detach().item()
         min_ret = torch.min(returns).detach().item()
         reduce_ret_tensor = torch.as_tensor(
-            [-min_ret, max_ret], device=torch.cuda.current_device(), dtype=torch.float32
+            [-min_ret, max_ret], device=device, dtype=torch.float32
         )
         torch.distributed.all_reduce(
             reduce_ret_tensor, op=torch.distributed.ReduceOp.MAX
@@ -140,6 +152,147 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             "returns_min": -min_ret,
         }
         rollout_metrics.update(returns_metrics)
+
+    if "eff_reward" in data_buffer:
+        eff_reward = data_buffer["eff_reward"].to(device)
+        if "eff_reward_count" in data_buffer:
+            count = data_buffer["eff_reward_count"].to(device).to(torch.float32)
+            value_sum = (eff_reward.to(torch.float32) * count).to(device)
+            torch.distributed.all_reduce(value_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            mean = torch.where(
+                count > 0, value_sum / count, torch.zeros_like(value_sum)
+            )
+            rollout_metrics.update({"eff_reward": mean.item()})
+        else:
+            torch.distributed.all_reduce(eff_reward, op=torch.distributed.ReduceOp.AVG)
+            rollout_metrics.update({"eff_reward": eff_reward.item()})
+    if "plan_reward" in data_buffer:
+        plan_reward = data_buffer["plan_reward"].to(device).to(torch.float32)
+        if "plan_reward_count" in data_buffer:
+            count = data_buffer["plan_reward_count"].to(device).to(torch.float32)
+            value_sum = (plan_reward * count).to(device)
+            torch.distributed.all_reduce(value_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            mean = torch.where(
+                count > 0, value_sum / count, torch.zeros_like(value_sum)
+            )
+            rollout_metrics.update({"plan_reward": mean.item()})
+        else:
+            torch.distributed.all_reduce(plan_reward, op=torch.distributed.ReduceOp.AVG)
+            rollout_metrics.update({"plan_reward": plan_reward.item()})
+    # Per-horizon success rates
+
+    def _agg_rate(success_key, total_key, out_key):
+        if (success_key in data_buffer) and (total_key in data_buffer):
+            succ = data_buffer[success_key].to(device).to(torch.float32)
+            tot = data_buffer[total_key].to(device).to(torch.float32)
+            torch.distributed.all_reduce(succ, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(tot, op=torch.distributed.ReduceOp.SUM)
+            rate = torch.where(tot > 0, succ / tot, torch.zeros_like(succ))
+            rollout_metrics[out_key] = rate.item()
+
+    plan_h_keys = sorted(
+        k
+        for k in data_buffer.keys()
+        if k.startswith("plan_h") and k.endswith("_success_count")
+    )
+    for success_key in plan_h_keys:
+        base = success_key[: -len("_success_count")]
+        total_key = f"{base}_total_count"
+        suffix = base[len("plan_") :]
+        out_key = f"plan_success_rate_{suffix}"
+        _agg_rate(success_key, total_key, out_key)
+    _agg_rate("plan_success_count", "plan_total_count", "plan_success_rate")
+
+    if "temporal_stability_penalty" in data_buffer:
+        temporal_penalty = data_buffer["temporal_stability_penalty"].to(device)
+        if "temporal_stability_penalty_count" in data_buffer:
+            count = (
+                data_buffer["temporal_stability_penalty_count"]
+                .to(device)
+                .to(torch.float32)
+            )
+            value_sum = (temporal_penalty.to(torch.float32) * count).to(device)
+            torch.distributed.all_reduce(value_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            mean = torch.where(
+                count > 0, value_sum / count, torch.zeros_like(value_sum)
+            )
+            rollout_metrics.update({"temporal_stability_penalty": mean.item()})
+        else:
+            torch.distributed.all_reduce(
+                temporal_penalty, op=torch.distributed.ReduceOp.AVG
+            )
+            rollout_metrics.update(
+                {"temporal_stability_penalty": temporal_penalty.item()}
+            )
+
+    if "STD_steps" in data_buffer:
+        std_steps = data_buffer["STD_steps"].to(device)
+        if "STD_steps_count" in data_buffer:
+            count = data_buffer["STD_steps_count"].to(device).to(torch.float32)
+            value_sum = (std_steps.to(torch.float32) * count).to(device)
+            torch.distributed.all_reduce(value_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            mean = torch.where(
+                count > 0, value_sum / count, torch.zeros_like(value_sum)
+            )
+            rollout_metrics.update({"STD_steps": mean.item()})
+        else:
+            torch.distributed.all_reduce(std_steps, op=torch.distributed.ReduceOp.AVG)
+            rollout_metrics.update({"STD_steps": std_steps.item()})
+
+    if "delta_pen" in data_buffer:
+        delta_pen = data_buffer["delta_pen"].to(device)
+        if "delta_pen_count" in data_buffer:
+            count = data_buffer["delta_pen_count"].to(device).to(torch.float32)
+            value_sum = (delta_pen.to(torch.float32) * count).to(device)
+            torch.distributed.all_reduce(value_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            mean = torch.where(
+                count > 0, value_sum / count, torch.zeros_like(value_sum)
+            )
+            rollout_metrics.update({"delta_pen": mean.item()})
+        else:
+            torch.distributed.all_reduce(delta_pen, op=torch.distributed.ReduceOp.AVG)
+            rollout_metrics.update({"delta_pen": delta_pen.item()})
+
+    if data_buffer.get("successes", None) is not None:
+        successes = data_buffer["successes"].to(device)
+        if successes.dtype is not torch.bool:
+            successes = successes.bool()
+        if successes.ndim == 3:
+            # [n_chunk_step, batch, num_action_chunks] -> [n_steps, batch]
+            success_flat = successes.transpose(1, 2).reshape(
+                successes.shape[0] * successes.shape[2], successes.shape[1]
+            )
+        elif successes.ndim == 2:
+            success_flat = successes
+        else:
+            success_flat = None
+        if success_flat is not None:
+            any_success = success_flat.any(dim=0)
+            if success_flat.numel() > 0:
+                first_idx = success_flat.float().argmax(dim=0)
+            else:
+                first_idx = torch.zeros(
+                    (success_flat.shape[1],), device=device, dtype=torch.float32
+                )
+            sum_idx = (first_idx[any_success].to(torch.float32) + 1.0).sum()
+            count = any_success.sum().to(torch.float32)
+            torch.distributed.all_reduce(sum_idx, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            if count.item() > 0:
+                mean_idx = (sum_idx / count).item()
+            else:
+                mean_idx = -1.0
+            rollout_metrics.update(
+                {
+                    "first_success_step": mean_idx,
+                    "first_success_step_count": count.item(),
+                }
+            )
 
     return rollout_metrics
 

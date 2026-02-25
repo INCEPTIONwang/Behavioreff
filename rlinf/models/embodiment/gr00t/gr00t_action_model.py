@@ -308,10 +308,11 @@ class FlowMatchingActionHeadForRLActionPrediction(FlowmatchingActionHead):
 
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
-        log_probs = torch.stack(log_probs, dim=1)[
-            :, :, : self.action_chunk, : self.valid_action_dim
-        ]
-        if compute_values:
+        log_probs = torch.stack(log_probs, dim=1)
+        log_probs_full = log_probs[:, :, :, : self.valid_action_dim]
+        log_probs = log_probs_full[:, :, : self.action_chunk]
+        should_compute_values = compute_values and hasattr(self, "value_head")
+        if should_compute_values:
             values = self.get_value(vl_embs, state_features)
             values = values[:, None]
         else:
@@ -324,6 +325,7 @@ class FlowMatchingActionHeadForRLActionPrediction(FlowmatchingActionHead):
             "action_pred": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
+            "prev_logprobs_full": log_probs_full,
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
@@ -375,7 +377,8 @@ class FlowMatchingActionHeadForRLActionPrediction(FlowmatchingActionHead):
             chains_log_probs.append(log_probs)
 
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
-        if compute_values:
+        should_compute_values = compute_values and hasattr(self, "value_head")
+        if should_compute_values:
             chains_values = self.get_value(vl_embs, state_features)
             chains_values = chains_values[:, None]
         else:
@@ -490,6 +493,36 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
                 return False
         return True
 
+    def _parse_action_horizons(
+        self, action_horizons: Any, batch_size: int, max_horizon: int
+    ) -> list[int]:
+        if action_horizons is None:
+            horizons = [self.output_action_chunks] * batch_size
+        elif torch.is_tensor(action_horizons):
+            horizons = action_horizons.detach().cpu().long().tolist()
+        elif isinstance(action_horizons, (int, float)):
+            horizons = [int(action_horizons)] * batch_size
+        else:
+            horizons = [int(v) for v in action_horizons]
+
+        if len(horizons) != batch_size:
+            raise ValueError(
+                f"action_horizons bsz 不匹配，期望 {batch_size}，实际 {len(horizons)}"
+            )
+
+        for h in horizons:
+            if h <= 0:
+                raise ValueError(f"action_horizons 中存在非法值 {h}，必须 > 0")
+            if h < self.output_action_chunks:
+                raise ValueError(
+                    f"action_horizons={h} 不能小于 num_action_chunks={self.output_action_chunks}"
+                )
+            if h > max_horizon:
+                raise ValueError(
+                    f"action_horizons={h} 超过模型最大规划长度 {max_horizon}"
+                )
+        return horizons
+
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
@@ -505,6 +538,7 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         use_cache: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
+        chunk_offset = kwargs.get("chunk_offset", 0)
         normalized_input = {
             "state": forward_inputs["state"],
             "state_mask": forward_inputs["state_mask"],
@@ -530,27 +564,72 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
             denoise_inds=denoise_inds,
             compute_values=compute_values,
         )
+        log_probs = log_probs[:, :, :, : self.valid_action_dim]
 
-        log_probs = log_probs[
-            :,
-            :,
-            : self.action_head.action_chunk,
-            : self.valid_action_dim,
-        ]
+        def _select_chunk(
+            x: torch.Tensor, chunk_off: int | torch.Tensor, chunk_len: int
+        ) -> torch.Tensor:
+            if x.shape[-2] <= chunk_len:
+                return x
+            if torch.is_tensor(chunk_off):
+                co = chunk_off.to(x.device).long().flatten()
+                if co.numel() == 1 and x.shape[0] > 1:
+                    co = co.expand(x.shape[0])
+                elif co.shape[0] != x.shape[0]:
+                    raise ValueError(
+                        f"chunk_offset bsz 不匹配，期望 {x.shape[0]}，实际 {co.shape[0]}"
+                    )
+                selected = []
+                for i in range(x.shape[0]):
+                    s = int(co[i].item())
+                    e = s + chunk_len
+                    selected.append(x[i, :, s:e, :])
+                return torch.stack(selected, dim=0)
+            s = int(chunk_off)
+            e = s + chunk_len
+            return x[:, :, s:e, :]
+
+        log_probs = _select_chunk(log_probs, chunk_offset, self.action_head.action_chunk)
         # post process
         if self.action_head.rl_config.joint_logprob:
             log_probs = log_probs.mean(dim=1)
-            prev_logprobs = kwargs["prev_logprobs"].mean(dim=1)
+            prev_logprobs = kwargs["prev_logprobs"]
+            if prev_logprobs.ndim == 4:
+                prev_logprobs = _select_chunk(
+                    prev_logprobs[:, :, :, : self.valid_action_dim],
+                    chunk_offset,
+                    self.action_head.action_chunk,
+                ).mean(dim=1)
         else:
             bsize = log_probs.shape[0]
             log_probs = log_probs[:, 0]
             prev_logprobs = kwargs["prev_logprobs"]
-            prev_logprobs = prev_logprobs[
-                torch.arange(bsize),
-                denoise_inds[:, 0],
-                : self.action_head.action_chunk,
-                : self.valid_action_dim,
-            ]
+            if prev_logprobs.ndim == 4:
+                prev_logprobs = prev_logprobs[
+                    torch.arange(bsize),
+                    denoise_inds[:, 0],
+                    :,
+                    : self.valid_action_dim,
+                ]
+            if prev_logprobs.ndim == 3 and prev_logprobs.shape[1] > self.action_head.action_chunk:
+                if torch.is_tensor(chunk_offset):
+                    co = chunk_offset.to(prev_logprobs.device).long().flatten()
+                    if co.numel() == 1 and prev_logprobs.shape[0] > 1:
+                        co = co.expand(prev_logprobs.shape[0])
+                    elif co.shape[0] != prev_logprobs.shape[0]:
+                        raise ValueError(
+                            f"chunk_offset bsz 不匹配，期望 {prev_logprobs.shape[0]}，实际 {co.shape[0]}"
+                        )
+                    selected_prev = []
+                    for i in range(prev_logprobs.shape[0]):
+                        s = int(co[i].item())
+                        e = s + self.action_head.action_chunk
+                        selected_prev.append(prev_logprobs[i, s:e, :])
+                    prev_logprobs = torch.stack(selected_prev, dim=0)
+                else:
+                    s = int(chunk_offset)
+                    e = s + self.action_head.action_chunk
+                    prev_logprobs = prev_logprobs[:, s:e, :]
         value_t = value_t.mean(dim=-1, keepdim=False)
 
         return {
@@ -565,6 +644,8 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self,
         env_obs,
         mode: Literal["train", "eval"] = "train",
+        action_horizons: Any = None,
+        return_full_plan: bool = False,
         **kwargs,
     ):
         # Here we have a source causing tiny inference-training inconsistency,
@@ -607,15 +688,65 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
             value=0,
         )
 
-        normalized_action, result = self._get_rl_action(normalized_input, mode=mode)
+        compute_values = kwargs.get(
+            "compute_values", hasattr(self.action_head, "value_head")
+        )
+        normalized_action, result = self._get_rl_action(
+            normalized_input, mode=mode, compute_values=compute_values
+        )
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
 
+        batch_size = int(normalized_action.shape[0])
+        max_horizon = (
+            int(normalized_action.shape[1])
+            if normalized_action.ndim >= 2
+            else int(self.output_action_chunks)
+        )
+        parsed_horizons = self._parse_action_horizons(
+            action_horizons, batch_size=batch_size, max_horizon=max_horizon
+        )
+
         raw_action = self.action_convert_fn(
             unnormalized_action, chunk_size=self.output_action_chunks
         )
+
+        if return_full_plan:
+            full_plan_actions = self.action_convert_fn(
+                unnormalized_action, chunk_size=max_horizon
+            )
+            if not is_batch:
+                full_plan_actions = np.expand_dims(full_plan_actions, axis=0)
+            if not torch.is_tensor(result["prev_logprobs_full"]):
+                raise RuntimeError("gr00t return_full_plan 缺少 prev_logprobs_full")
+            logprobs_full = result["prev_logprobs_full"]
+            denoise_inds = result["forward_inputs"]["denoise_inds"]
+            if self.action_head.rl_config.joint_logprob:
+                selected_logprobs = logprobs_full.mean(dim=1)
+            else:
+                denoise_inds = denoise_inds.to(logprobs_full.device)
+                selected_logprobs = logprobs_full[
+                    torch.arange(batch_size, device=logprobs_full.device),
+                    denoise_inds[:, 0],
+                ]
+
+            plan_actions_list: list[torch.Tensor] = []
+            plan_logprobs_full_list: list[torch.Tensor] = []
+            for i, h in enumerate(parsed_horizons):
+                plan_actions_list.append(
+                    torch.as_tensor(full_plan_actions[i, :h], dtype=torch.float32)
+                    .detach()
+                    .cpu()
+                    .contiguous()
+                )
+                plan_logprobs_full_list.append(
+                    selected_logprobs[i, :h].detach().cpu().contiguous()
+                )
+
+            result["plan_actions"] = plan_actions_list
+            result["plan_prev_logprobs_full"] = plan_logprobs_full_list
 
         return raw_action, result
 
@@ -648,13 +779,14 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self,
         normalized_input: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
+        compute_values: bool = True,
     ) -> torch.Tensor:
         # We expand get_action() and replace action head inference with RL inference.
         backbone_inputs, action_inputs = self.prepare_input(normalized_input)
         # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
         backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs, rlinf_outputs = self.action_head.get_rl_action(
-            backbone_outputs, action_inputs, mode=mode
+            backbone_outputs, action_inputs, mode=mode, compute_values=compute_values
         )
         actions = rlinf_outputs["actions"]
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
@@ -679,6 +811,7 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
 
         result = {
             "prev_logprobs": rlinf_outputs["prev_logprobs"],
+            "prev_logprobs_full": rlinf_outputs["prev_logprobs_full"],
             "prev_values": rlinf_outputs["prev_values"],
             "forward_inputs": forward_inputs,
         }

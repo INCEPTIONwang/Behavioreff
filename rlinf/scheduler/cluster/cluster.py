@@ -72,12 +72,16 @@ class ClusterEnvVar(str, Enum):
         export RLINF_EXT_MODULE=workflows.scripts.rlinf_ext
     """
 
+    NAMESPACE = "NAMESPACE"
+    """Ray namespace used by RLinf. Set via RLINF_NAMESPACE."""
+
 
 class Cluster:
     """A singleton class that manages the cluster resources for Ray workers."""
 
     SYS_NAME = "RLinf"
-    NAMESPACE = SYS_NAME
+    BASE_NAMESPACE = os.getenv(f"{SYS_NAME.upper()}_{ClusterEnvVar.NAMESPACE.value}", SYS_NAME)
+    NAMESPACE = BASE_NAMESPACE
     LOGGING_LEVEL = os.getenv(
         f"{SYS_NAME.upper()}_{ClusterEnvVar.LOG_LEVEL.value}", "INFO"
     ).upper()
@@ -89,6 +93,7 @@ class Cluster:
         ClusterEnvVar.NODE_RANK: None,
         ClusterEnvVar.COMM_NET_DEVICES: None,
         ClusterEnvVar.EXT_MODULE: None,
+        ClusterEnvVar.NAMESPACE: None,
     }
 
     class NamespaceConflictError(Exception):
@@ -139,7 +144,9 @@ class Cluster:
                     self._logger.info(
                         f"Ray namespace conflict detected. Retrying to initialize Cluster with a new namespace (attempt {self._ray_instance_count})."
                     )
-                    Cluster.NAMESPACE = f"{Cluster.SYS_NAME}_{self._ray_instance_count}"
+                    Cluster.NAMESPACE = (
+                        f"{Cluster.BASE_NAMESPACE}_{self._ray_instance_count}"
+                    )
         else:
             try:
                 self._init_from_existing_managers()
@@ -272,6 +279,9 @@ class Cluster:
                 .options(name=NodeManager.MANAGER_NAME, runtime_env=runtime_env)
                 .remote(self._nodes, self._node_groups, self._cluster_cfg)
             )
+            # Ensure NodeManager is fully initialized before launching managers
+            # that call Cluster() in their constructor (e.g. DeviceLockManager).
+            ray.get(self._node_manager.get_nodes.remote())
             self._device_lock_manager = (
                 ray.remote(DeviceLockManager)
                 .options(name=DeviceLockManager.MANAGER_NAME, runtime_env=runtime_env)

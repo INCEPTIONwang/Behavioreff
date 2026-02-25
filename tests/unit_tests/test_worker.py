@@ -180,7 +180,6 @@ class TestWorkerGroup:
         assert len(results2) == num_workers
         assert sorted(results2) == [200 + i for i in range(num_workers)]
 
-
 class TestLoadUserExtensions:
     """Tests for the Worker._load_user_extensions method."""
 
@@ -208,6 +207,106 @@ class TestLoadUserExtensions:
             with mock.patch("importlib.import_module", return_value=mock_module):
                 worker._load_user_extensions()
                 mock_module.register.assert_called_once()
+def test_openpi_get_log_prob_value_respects_plan_horizon():
+    pytest.importorskip("openpi")
+    from types import SimpleNamespace
+
+    from rlinf.models.embodiment.openpi.openpi_action_model import (
+        OpenPi0ForRLActionPrediction,
+    )
+
+    model = object.__new__(OpenPi0ForRLActionPrediction)
+    model.config = SimpleNamespace(
+        joint_logprob=False,
+        num_steps=10,
+        noise_method="flow_sde",
+        safe_get_logprob=False,
+    )
+    model.use_vlm_value = False
+
+    def embed_prefix(images, img_masks, lang_tokens, lang_masks):
+        bsz = lang_tokens.shape[0]
+        prefix_embs = torch.zeros((bsz, 1, 1), dtype=torch.float32)
+        prefix_pad_masks = torch.ones((bsz, 1), dtype=torch.long)
+        prefix_att_masks = torch.ones((bsz, 1), dtype=torch.long)
+        return prefix_embs, prefix_pad_masks, prefix_att_masks
+
+    model.embed_prefix = embed_prefix
+
+    def _prepare_attention_masks_4d(x):
+        return x
+
+    model._prepare_attention_masks_4d = _prepare_attention_masks_4d
+
+    class _DummyExpert:
+        def forward(
+            self,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            use_cache=None,
+            adarms_cond=None,
+        ):
+            bsz = attention_mask.shape[0]
+            prefix_output = torch.zeros((bsz, 1, 1), dtype=torch.float32)
+            return [prefix_output, None], None
+
+    model.paligemma_with_expert = SimpleNamespace(
+        paligemma=SimpleNamespace(
+            language_model=SimpleNamespace(config=SimpleNamespace())
+        ),
+        forward=_DummyExpert().forward,
+    )
+
+    model._recorded_action_horizons = []
+
+    def sample_mean_var_val(
+        x_t,
+        idx,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        mode,
+        denoise_steps,
+        compute_values=True,
+        action_horizon=None,
+    ):
+        model._recorded_action_horizons.append(int(action_horizon))
+        x_t_mean = torch.zeros_like(x_t)
+        x_t_std = torch.ones_like(x_t)
+        value_t = torch.zeros((state.shape[0],), device=state.device)
+        return x_t_mean, x_t_std, value_t
+
+    model.sample_mean_var_val = sample_mean_var_val
+
+    bsz = 4
+    max_h = 15
+    action_dim = 3
+    images = [torch.zeros((bsz, 1))]
+    img_masks = [torch.ones((bsz, 1))]
+    lang_tokens = torch.zeros((bsz, 1), dtype=torch.long)
+    lang_masks = torch.ones((bsz, 1), dtype=torch.long)
+    state = torch.zeros((bsz, 1), dtype=torch.float32)
+    chains = torch.randn((bsz, 2, max_h, action_dim), dtype=torch.float32)
+    denoise_inds = torch.zeros((bsz, 1), dtype=torch.long)
+    plan_horizon = torch.tensor([5, 10, 15, 10], dtype=torch.long)
+
+    log_probs, _, _ = model.get_log_prob_value(
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        chains,
+        denoise_inds,
+        compute_values=False,
+        plan_horizon=plan_horizon,
+    )
+
+    assert set(model._recorded_action_horizons) == {5, 10, 15}
+    assert torch.all(log_probs[0, 0, 5:] == 0)
+    assert torch.all(log_probs[1, 0, 10:] == 0)
 
 
 if __name__ == "__main__":

@@ -18,3 +18,10 @@ outputs/*
 .docs-venv
 uv.lock
 rlinf/envs/maniskill/assets
+models/*
+test/*
+Isaac-GR00T/
+LIBERO/
+SpecRlinf/
+.github/*
+.cursor/*

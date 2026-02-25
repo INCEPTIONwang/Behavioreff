@@ -82,11 +82,16 @@ class EmbodiedRunner:
         self.logger = get_logger()
         self.metric_logger = MetricLogger(cfg)
 
-        # Async logging setup
+        # Console table logging: default to sync to avoid interleaving with
+        # worker-side tqdm/ray logs.
+        self.async_table_print = bool(self.cfg.runner.get("async_table_print", False))
         self.stop_logging = False
-        self.log_queue = queue.Queue()
-        self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
-        self.log_thread.start()
+        self.log_queue = None
+        self.log_thread = None
+        if self.async_table_print:
+            self.log_queue = queue.Queue()
+            self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
+            self.log_thread.start()
 
     def _log_worker(self):
         """Background thread for processing log messages."""
@@ -110,7 +115,15 @@ class EmbodiedRunner:
         metrics: dict,
         start_step: int = 0,
     ):
-        """Async version that puts table printing in queue."""
+        """
+        Print metrics table.
+
+        Kept method name for compatibility: by default this is synchronous to
+        avoid mixed/incomplete terminal output.
+        """
+        if not self.async_table_print:
+            print_metrics_table(step, total_steps, start_time, metrics, start_step)
+            return
         self.log_queue.put(
             (print_metrics_table, (step, total_steps, start_time, metrics, start_step))
         )
@@ -264,9 +277,10 @@ class EmbodiedRunner:
         self.metric_logger.finish()
 
         # Stop logging thread
-        self.stop_logging = True
-        self.log_queue.join()  # Wait for all queued logs to be processed
-        self.log_thread.join(timeout=1.0)
+        if self.async_table_print:
+            self.stop_logging = True
+            self.log_queue.join()  # Wait for all queued logs to be processed
+            self.log_thread.join(timeout=1.0)
 
     def _save_checkpoint(self):
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")

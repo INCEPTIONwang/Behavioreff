@@ -295,6 +295,7 @@ class ManiskillEnv(gym.Env):
         obs_list = []
         infos_list = []
         chunk_rewards = []
+        chunk_successes = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
         for i in range(chunk_size):
@@ -306,6 +307,15 @@ class ManiskillEnv(gym.Env):
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
+            if isinstance(infos, dict) and "success" in infos:
+                step_success = infos["success"]
+            else:
+                step_success = terminations
+            if not torch.is_tensor(step_success):
+                step_success = torch.as_tensor(step_success, device=self.device)
+            if step_success.dtype is not torch.bool:
+                step_success = step_success.bool()
+            chunk_successes.append(step_success)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
@@ -331,6 +341,8 @@ class ManiskillEnv(gym.Env):
 
         chunk_truncations = torch.zeros_like(raw_chunk_truncations)
         chunk_truncations[:, -1] = past_truncations
+        if isinstance(infos, dict):
+            infos["chunk_successes"] = torch.stack(chunk_successes, dim=1)
         return (
             obs_list,
             chunk_rewards,
